@@ -1,0 +1,757 @@
+=== MCP CODING AGENT AUDIT ===
+Workspace: /home/administrator/ml-project/agent-workspace
+
+
+==================== client.py ====================
+0001: 
+0002: import asyncio
+0003: import json
+0004: import os
+0005: import sys
+0006: import urllib.error
+0007: import urllib.request
+0008: from pathlib import Path
+0009: 
+0010: from mcp import ClientSession, StdioServerParameters
+0011: from mcp.client.stdio import stdio_client
+0012: 
+0013: 
+0014: BASE_DIR = Path(__file__).resolve().parent
+0015: MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+0016: CONFIG_FILE = Path.home() / ".config/remote-ollama/env"
+0017: 
+0018: 
+0019: SYSTEM_PROMPT = """
+0020: You are a careful coding agent connected to a remote Ollama model
+0021: and a local MCP coding server.
+0022: 
+0023: Rules:
+0024: - Inspect files using tools before making claims about a project.
+0025: - Use relative paths inside the configured workspace.
+0026: - Explain proposed changes before applying them.
+0027: - Never claim a tool ran unless it actually ran.
+0028: - Never apply edits without explicit user approval.
+0029: - Prefer small, targeted, testable changes.
+0030: [REDACTED: POSSIBLE CREDENTIAL]
+
+0031: - Use create_directory and write_file to scaffold new projects.\n- Use run_command for approved npm, Node.js, Python, and test commands.\n- Work only in the active workspace and never modify unrelated projects.\n- If a tool fails, explain the error honestly.
+0032: """
+0033: 
+0034: 
+0035: def load_config():
+0036:     """Load remote Ollama connection settings."""
+0037:     if CONFIG_FILE.exists():
+0038:         for line in CONFIG_FILE.read_text().splitlines():
+0039:             line = line.strip()
+0040: 
+0041:             if not line or line.startswith("#") or "=" not in line:
+0042:                 continue
+0043: 
+0044:             key, value = line.split("=", 1)
+0045:             key = key.strip()
+0046:             value = value.strip().strip("'\"")
+0047: 
+0048:             os.environ.setdefault(key, value)
+0049: 
+0050:     url = os.environ.get("OLLAMA_REMOTE_URL", "").rstrip("/")
+0051: [REDACTED: POSSIBLE CREDENTIAL]
+
+0052: 
+0053: [REDACTED: POSSIBLE CREDENTIAL]
+
+0054:         raise RuntimeError(
+0055: [REDACTED: POSSIBLE CREDENTIAL]
+
+0056:             f"Check {CONFIG_FILE}"
+0057:         )
+0058: 
+0059: [REDACTED: POSSIBLE CREDENTIAL]
+
+0060: 
+0061: 
+0062: def ollama_chat(messages, tools):
+0063:     """Send a chat request to the remote Ollama API."""
+0064: [REDACTED: POSSIBLE CREDENTIAL]
+
+0065: 
+0066:     payload = {
+0067:         "model": MODEL,
+0068:         "messages": messages,
+0069:         "stream": False,
+0070:         "tools": tools,
+0071:         "options": {
+0072:             "num_ctx": 4096,
+0073:             "num_predict": 1200,
+0074:             "temperature": 0.1,
+0075:         },
+0076:     }
+0077: 
+0078:     request = urllib.request.Request(
+0079:         f"{base_url}/api/chat",
+0080:         data=json.dumps(payload).encode("utf-8"),
+0081:         headers={
+0082: [REDACTED: POSSIBLE CREDENTIAL]
+
+0083:             "Content-Type": "application/json",
+0084:         },
+0085:         method="POST",
+0086:     )
+0087: 
+0088:     try:
+0089:         with urllib.request.urlopen(request, timeout=300) as response:
+0090:             result = json.load(response)
+0091: 
+0092:     except urllib.error.HTTPError as exc:
+0093:         detail = exc.read().decode("utf-8", errors="replace")
+0094:         raise RuntimeError(
+0095:             f"Ollama HTTP {exc.code}: {detail}"
+0096:         ) from exc
+0097: 
+0098:     except urllib.error.URLError as exc:
+0099:         raise RuntimeError(
+0100:             f"Could not reach remote Ollama: {exc.reason}. "
+0101:             "Check your internet connection and Kaggle tunnel."
+0102:         ) from exc
+0103: 
+0104:     except TimeoutError as exc:
+0105:         raise RuntimeError(
+0106:             "The remote Ollama request timed out."
+0107:         ) from exc
+0108: 
+0109:     if not isinstance(result, dict):
+0110:         raise RuntimeError("Ollama returned an unexpected response.")
+0111: 
+0112:     message = result.get("message")
+0113: 
+0114:     if not isinstance(message, dict):
+0115:         raise RuntimeError(
+0116:             "Ollama response has no message field: "
+0117:             + json.dumps(result)[:1500]
+0118:         )
+0119: 
+0120:     return message
+0121: 
+0122: 
+0123: def schema_to_ollama(tool):
+0124:     """Convert an MCP tool schema to Ollama's function-tool format."""
+0125:     return {
+0126:         "type": "function",
+0127:         "function": {
+0128:             "name": tool.name,
+0129:             "description": tool.description or tool.name,
+0130:             "parameters": tool.inputSchema,
+0131:         },
+0132:     }
+0133: 
+0134: 
+0135: def parse_tool_arguments(arguments):
+0136:     """Normalize tool-call arguments to a dictionary."""
+0137:     if isinstance(arguments, dict):
+0138:         return arguments
+0139: 
+0140:     if isinstance(arguments, str):
+0141:         try:
+0142:             parsed = json.loads(arguments)
+0143:         except json.JSONDecodeError as exc:
+0144:             raise ValueError(
+0145:                 f"Invalid JSON in tool arguments: {exc}"
+0146:             ) from exc
+0147: 
+0148:         if isinstance(parsed, dict):
+0149:             return parsed
+0150: 
+0151:     raise ValueError("Tool arguments must be a JSON object.")
+0152: 
+0153: 
+0154: def get_tool_output(result):
+0155:     """Extract readable content from an MCP tool result."""
+0156:     parts = []
+0157: 
+0158:     for item in result.content:
+0159:         if hasattr(item, "text"):
+0160:             parts.append(item.text)
+0161: 
+0162:     output = "\n".join(parts) or "(Tool returned no text.)"
+0163: 
+0164:     if result.isError:
+0165:         output = "TOOL ERROR: " + output
+0166: 
+0167:     return output
+0168: 
+0169: 
+0170: def request_edit_approval(name, arguments):
+0171:     """Ask for explicit approval before every file change or command."""
+0172:     protected = {"apply_edit", "write_file", "run_command"}
+0173:     if name not in protected:
+0174:         return True
+0175: 
+0176:     print("\\n--- APPROVAL REQUIRED ---")
+0177:     print("Tool:", name)
+0178:     for key, value in arguments.items():
+0179:         if key != "confirm":
+0180:             preview = str(value)
+0181:             if len(preview) > 1800:
+0182:                 preview = preview[:1800] + "\\n... [preview truncated]"
+0183:             print(f"{key}:\\n{preview}")
+0184: 
+0185:     answer = input("\\nProceed? Type YES to approve: ").strip()
+0186:     if answer != "YES":
+0187:         print("Declined. No change or command was applied.")
+0188:         return False
+0189: 
+0190:     # The server independently checks this flag.
+0191:     arguments["confirm"] = True
+0192:     return True
+0193: 
+0194: 
+0195: async def main():
+0196:     try:
+0197:         load_config()
+0198:     except Exception as exc:
+0199:         print(f"Configuration error: {exc}", file=sys.stderr)
+0200:         return
+0201: 
+0202:     workspace = Path.home() / "HopeLinkCancer-AI"
+0203:     workspace.mkdir(parents=True, exist_ok=True)
+0204: 
+0205:     server_env = os.environ.copy()
+0206:     server_env["CODING_WORKSPACE"] = str(workspace)
+0207: 
+0208:     server_params = StdioServerParameters(
+0209:         command=sys.executable,
+0210:         args=[str(BASE_DIR / "server.py")],
+0211:         cwd=str(BASE_DIR),
+0212:         env=server_env,
+0213:     )
+0214: 
+0215:     print("Starting MCP coding agent...")
+0216:     print(f"Workspace server: {BASE_DIR / 'server.py'}")
+0217: 
+0218:     try:
+0219:         async with stdio_client(server_params) as (
+0220:             read_stream,
+0221:             write_stream,
+0222:         ):
+0223:             async with ClientSession(
+0224:                 read_stream, write_stream
+0225:             ) as session:
+0226:                 await session.initialize()
+0227: 
+0228:                 mcp_response = await session.list_tools()
+0229:                 mcp_tools = mcp_response.tools
+0230: 
+0231:                 tools = [
+0232:                     schema_to_ollama(tool)
+0233:                     for tool in mcp_tools
+0234:                 ]
+0235: 
+0236:                 tool_names = {
+0237:                     tool.name for tool in mcp_tools
+0238:                 }
+0239: 
+0240:                 print(f"Connected to MCP server. Tools: {len(tools)}")
+0241:                 print(f"Remote model: {MODEL}")
+0242:                 print("Commands: /clear, /tools, exit")
+0243:                 print("")
+0244: 
+0245:                 messages = [
+0246:                     {
+0247:                         "role": "system",
+0248:                         "content": SYSTEM_PROMPT,
+0249:                     }
+0250:                 ]
+0251: 
+0252:                 while True:
+0253:                     try:
+0254:                         user_text = input("\nYou> ").strip()
+0255:                     except (EOFError, KeyboardInterrupt):
+0256:                         print("\nExiting...")
+0257:                         break
+0258: 
+0259:                     if user_text.startswith("/load "):
+0260:                         prompt_path = Path(
+0261:                             user_text[len("/load "):].strip()
+0262:                         ).expanduser()
+0263: 
+0264:                         try:
+0265:                             user_text = prompt_path.read_text(
+0266:                                 encoding="utf-8"
+0267:                             ).strip()
+0268:                         except Exception as exc:
+0269:                             print(f"Could not load prompt file: {exc}")
+0270:                             continue
+0271: 
+0272:                         if not user_text:
+0273:                             print("Prompt file is empty.")
+0274:                             continue
+0275: 
+0276:                         print(
+0277:                             f"Loaded {len(user_text)} characters "
+0278:                             f"from {prompt_path}"
+0279:                         )
+0280: 
+0281:                     if not user_text:
+0282:                         continue
+0283: 
+0284:                     if user_text.lower() in {"exit", "quit"}:
+0285:                         break
+0286: 
+0287:                     if user_text == "/clear":
+0288:                         messages = [
+0289:                             {
+0290:                                 "role": "system",
+0291:                                 "content": SYSTEM_PROMPT,
+0292:                             }
+0293:                         ]
+0294:                         print("Conversation history cleared.")
+0295:                         continue
+0296: 
+0297:                     if user_text == "/tools":
+0298:                         print("\nAvailable MCP tools:")
+0299:                         for tool in mcp_tools:
+0300:                             print(f"- {tool.name}: {tool.description or ''}")
+0301:                         continue
+0302: 
+0303:                     messages.append({
+0304:                         "role": "user",
+0305:                         "content": user_text,
+0306:                     })
+0307: 
+0308:                     for round_number in range(8):
+0309:                         try:
+0310:                             answer = await asyncio.to_thread(
+0311:                                 ollama_chat,
+0312:                                 messages,
+0313:                                 tools,
+0314:                             )
+0315:                         except Exception as exc:
+0316:                             print(f"\nRemote model error: {exc}")
+0317:                             # Avoid keeping a failed request in history.
+0318:                             messages.pop()
+0319:                             break
+0320: 
+0321:                         # Keep the assistant response, including tool calls,
+0322:                         # in the conversation sent back to Ollama.
+0323:                         messages.append(answer)
+0324: 
+0325:                         calls = answer.get("tool_calls") or []
+0326: 
+0327:                         if not calls:
+0328:                             content = answer.get("content", "")
+0329:                             print("\nAssistant>\n" + content)
+0330:                             break
+0331: 
+0332:                         for call in calls:
+0333:                             function = call.get("function", {})
+0334:                             name = function.get("name", "")
+0335:                             raw_arguments = function.get("arguments", {})
+0336: 
+0337:                             try:
+0338:                                 arguments = parse_tool_arguments(
+0339:                                     raw_arguments
+0340:                                 )
+0341: 
+0342:                                 if name not in tool_names:
+0343:                                     raise ValueError(
+0344:                                         f"Unknown MCP tool: {name}"
+0345:                                     )
+0346: 
+0347:                                 if not request_edit_approval(
+0348:                                     name, arguments
+0349:                                 ):
+0350:                                     output = (
+0351:                                         "EDIT NOT APPLIED. The user did "
+0352:                                         "not approve this change. Explain "
+0353:                                         "the proposed edit and wait for "
+0354:                                         "a new request."
+0355:                                     )
+0356:                                 else:
+0357:                                     result = await session.call_tool(
+0358:                                         name, arguments
+0359:                                     )
+0360:                                     output = get_tool_output(result)
+0361: 
+0362:                             except Exception as exc:
+0363:                                 output = f"TOOL ERROR: {exc}"
+0364: 
+0365:                             # Return each tool result to Ollama, including
+0366:                             # the function name for clearer tool tracking.
+0367:                             messages.append({
+0368:                                 "role": "tool",
+0369:                                 "name": name,
+0370:                                 "content": output[:12000],
+0371:                             })
+0372: 
+0373:                             print(f"\n[{name}]\n{output[:2500]}")
+0374: 
+0375:                     else:
+0376:                         print(
+0377:                             "\nStopped after 8 tool rounds to "
+0378:                             "prevent runaway calls."
+0379:                         )
+0380: 
+0381:     except Exception as exc:
+0382:         print(f"\nMCP client error: {exc}", file=sys.stderr)
+0383: 
+0384:     print("\nClient closed.")
+0385: 
+0386: 
+0387: if __name__ == "__main__":
+0388:     asyncio.run(main())
+
+==================== server.py ====================
+0001: import difflib
+0002: import os
+0003: import subprocess
+0004: import shlex
+0005: from pathlib import Path
+0006: 
+0007: from mcp.server.fastmcp import FastMCP
+0008: 
+0009: mcp = FastMCP("Remote DeepSeek Coding Agent")
+0010: 
+0011: WORKSPACE = Path(
+0012:     os.environ.get("CODING_WORKSPACE", str(Path.home() / "ml-project"))
+0013: ).expanduser().resolve()
+0014: 
+0015: MAX_FILE_BYTES = 300_000
+0016: IGNORED_DIRS = {
+0017:     ".git", ".venv", "venv", "node_modules",
+0018:     "__pycache__", ".next", "dist", "build"
+0019: }
+0020: 
+0021: 
+0022: def safe_path(relative_path: str) -> Path:
+0023:     """Resolve a path and prevent access outside the workspace."""
+0024:     path = (WORKSPACE / relative_path).resolve()
+0025:     if path != WORKSPACE and WORKSPACE not in path.parents:
+0026:         raise ValueError("Path is outside the configured workspace.")
+0027:     return path
+0028: 
+0029: 
+0030: def require_file(path: Path) -> None:
+0031:     if not path.is_file():
+0032:         raise FileNotFoundError(f"File not found: {path}")
+0033:     if path.stat().st_size > MAX_FILE_BYTES:
+0034:         raise ValueError("File is too large to process safely.")
+0035: 
+0036: 
+0037: @mcp.tool()
+0038: def workspace_info() -> str:
+0039:     """Show the configured workspace directory."""
+0040:     return f"Workspace: {WORKSPACE}"
+0041: 
+0042: 
+0043: @mcp.tool()
+0044: def list_files(path: str = ".", max_entries: int = 200) -> str:
+0045:     """List files under a workspace-relative directory."""
+0046:     root = safe_path(path)
+0047:     if not root.is_dir():
+0048:         raise NotADirectoryError(path)
+0049: 
+0050:     results = []
+0051:     for item in sorted(root.rglob("*")):
+0052:         if any(part in IGNORED_DIRS for part in item.parts):
+0053:             continue
+0054:         if item.is_file():
+0055:             results.append(str(item.relative_to(WORKSPACE)))
+0056:             if len(results) >= min(max_entries, 500):
+0057:                 break
+0058: 
+0059:     return "\n".join(results) if results else "No files found."
+0060: 
+0061: 
+0062: @mcp.tool()
+0063: def read_file(path: str) -> str:
+0064:     """Read a UTF-8 text file within the workspace."""
+0065:     target = safe_path(path)
+0066:     require_file(target)
+0067:     try:
+0068:         return target.read_text(encoding="utf-8")
+0069:     except UnicodeDecodeError as exc:
+0070:         raise ValueError("File is not UTF-8 text.") from exc
+0071: 
+0072: 
+0073: @mcp.tool()
+0074: def search_code(query: str, path: str = ".", max_results: int = 80) -> str:
+0075:     """Search text files for a literal, case-insensitive query."""
+0076:     root = safe_path(path)
+0077:     if not root.exists():
+0078:         raise FileNotFoundError(path)
+0079: 
+0080:     results = []
+0081:     candidates = [root] if root.is_file() else root.rglob("*")
+0082: 
+0083:     for item in candidates:
+0084:         if not item.is_file():
+0085:             continue
+0086:         if any(part in IGNORED_DIRS for part in item.parts):
+0087:             continue
+0088:         try:
+0089:             if item.stat().st_size > MAX_FILE_BYTES:
+0090:                 continue
+0091:             lines = item.read_text(encoding="utf-8").splitlines()
+0092:         except (OSError, UnicodeDecodeError):
+0093:             continue
+0094: 
+0095:         for line_no, line in enumerate(lines, 1):
+0096:             if query.casefold() in line.casefold():
+0097:                 results.append(
+0098:                     f"{item.relative_to(WORKSPACE)}:{line_no}: {line[:300]}"
+0099:                 )
+0100:                 if len(results) >= min(max_results, 300):
+0101:                     return "\n".join(results)
+0102: 
+0103:     return "\n".join(results) if results else "No matches found."
+0104: 
+0105: 
+0106: @mcp.tool()
+0107: def propose_edit(path: str, old_text: str, new_text: str) -> str:
+0108:     """Preview an exact text replacement. Does not modify the file."""
+0109:     target = safe_path(path)
+0110:     require_file(target)
+0111:     original = target.read_text(encoding="utf-8")
+0112: 
+0113:     occurrences = original.count(old_text)
+0114:     if not old_text:
+0115:         raise ValueError("old_text must not be empty.")
+0116:     if occurrences != 1:
+0117:         raise ValueError(
+0118:             f"Expected old_text exactly once, found {occurrences}. "
+0119:             "Provide a more specific snippet."
+0120:         )
+0121: 
+0122:     updated = original.replace(old_text, new_text, 1)
+0123:     diff = difflib.unified_diff(
+0124:         original.splitlines(True),
+0125:         updated.splitlines(True),
+0126:         fromfile=f"a/{path}",
+0127:         tofile=f"b/{path}",
+0128:     )
+0129:     return "".join(diff) or "No changes."
+0130: 
+0131: 
+0132: @mcp.tool()
+0133: def apply_edit(path: str, old_text: str, new_text: str,
+0134:                confirm: bool = False) -> str:
+0135:     """Apply an exact replacement only when confirm=True."""
+0136:     if not confirm:
+0137:         return "Not changed. Review propose_edit output, then call with confirm=True."
+0138: 
+0139:     target = safe_path(path)
+0140:     require_file(target)
+0141:     original = target.read_text(encoding="utf-8")
+0142: 
+0143:     if not old_text or original.count(old_text) != 1:
+0144:         raise ValueError("old_text must match exactly once.")
+0145: 
+0146:     updated = original.replace(old_text, new_text, 1)
+0147:     target.write_text(updated, encoding="utf-8")
+0148:     return f"Updated {path}. Review the diff and run relevant tests."
+0149: 
+0150: 
+0151: @mcp.tool()
+0152: def run_python_tests(path: str = ".") -> str:
+0153:     """Run pytest on a workspace-relative path, with a timeout."""
+0154:     target = safe_path(path)
+0155:     if not target.exists():
+0156:         raise FileNotFoundError(path)
+0157: 
+0158:     result = subprocess.run(
+0159:         ["python", "-m", "pytest", str(target)],
+0160:         cwd=WORKSPACE,
+0161:         capture_output=True,
+0162:         text=True,
+0163:         timeout=120,
+0164:         check=False,
+0165:     )
+0166:     output = (result.stdout + "\n" + result.stderr).strip()
+0167:     return f"Exit code: {result.returncode}\n{output[-12000:]}"
+0168: 
+0169: 
+0170: 
+0171: @mcp.tool()
+0172: def create_directory(path: str) -> str:
+0173:     """Create a directory inside the active workspace."""
+0174:     target = safe_path(path)
+0175:     target.mkdir(parents=True, exist_ok=True)
+0176:     return f"Directory ready: {path}"
+0177: 
+0178: 
+0179: @mcp.tool()
+0180: def write_file(
+0181:     path: str,
+0182:     content: str,
+0183:     overwrite: bool = False,
+0184:     confirm: bool = False,
+0185: ) -> str:
+0186:     """Create a UTF-8 file or replace one after explicit approval."""
+0187:     target = safe_path(path)
+0188: 
+0189:     if not confirm:
+0190:         return "NOT WRITTEN: explicit user approval is required."
+0191: 
+0192:     if target.exists() and not overwrite:
+0193:         raise FileExistsError(
+0194:             f"{path} already exists. Set overwrite=true only if replacement is intended."
+0195:         )
+0196: 
+0197:     if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+0198:         raise ValueError("Content exceeds the maximum file size.")
+0199: 
+0200:     target.parent.mkdir(parents=True, exist_ok=True)
+0201:     target.write_text(content, encoding="utf-8")
+0202:     return f"Wrote {path} ({len(content.encode('utf-8'))} bytes)."
+0203: 
+0204: 
+0205: @mcp.tool()
+0206: def run_command(
+0207:     command: str,
+0208:     path: str = ".",
+0209:     timeout: int = 120,
+0210:     confirm: bool = False,
+0211: ) -> str:
+0212:     """Run an approved development command inside the workspace."""
+0213:     if not confirm:
+0214:         return "NOT RUN: explicit user approval is required."
+0215: 
+0216:     working_dir = safe_path(path)
+0217:     if not working_dir.is_dir():
+0218:         raise NotADirectoryError(path)
+0219: 
+0220:     args = shlex.split(command)
+0221:     if not args:
+0222:         raise ValueError("Command cannot be empty.")
+0223: 
+0224:     allowed = {"npm", "npx", "node", "python", "python3", "pytest"}
+0225:     executable = Path(args[0]).name
+0226:     if executable not in allowed:
+0227:         raise ValueError(
+0228:             f"Command '{executable}' is not allowed. "
+0229:             f"Allowed commands: {', '.join(sorted(allowed))}"
+0230:         )
+0231: 
+0232:     result = subprocess.run(
+0233:         args,
+0234:         cwd=working_dir,
+0235:         capture_output=True,
+0236:         text=True,
+0237:         timeout=max(1, min(timeout, 120)),
+0238:         check=False,
+0239:     )
+0240:     output = (result.stdout + "\n" + result.stderr).strip()
+0241:     return f"Exit code: {result.returncode}\n{output[-12000:]}"
+0242: 
+0243: if __name__ == "__main__":
+0244:     print(f"Workspace: {WORKSPACE}", file=__import__("sys").stderr, flush=True)
+0245:     mcp.run()
+
+==================== ai.py ====================
+0001: import json
+0002: import os
+0003: import urllib.error
+0004: import urllib.request
+0005: from pathlib import Path
+0006: 
+0007: CONFIG_FILE = Path.home() / ".config/remote-ollama/env"
+0008: 
+0009: 
+0010: def load_config():
+0011:     """Load private connection settings from the config file."""
+0012:     if CONFIG_FILE.exists():
+0013:         for line in CONFIG_FILE.read_text().splitlines():
+0014:             line = line.strip()
+0015:             if not line or line.startswith("#") or "=" not in line:
+0016:                 continue
+0017:             key, value = line.split("=", 1)
+0018:             os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+0019: 
+0020:     url = os.environ.get("OLLAMA_REMOTE_URL", "").rstrip("/")
+0021: [REDACTED: POSSIBLE CREDENTIAL]
+
+0022: 
+0023: [REDACTED: POSSIBLE CREDENTIAL]
+
+0024:         raise RuntimeError(
+0025: [REDACTED: POSSIBLE CREDENTIAL]
+
+0026:             f"in {CONFIG_FILE}"
+0027:         )
+0028: 
+0029: [REDACTED: POSSIBLE CREDENTIAL]
+
+0030: 
+0031: 
+0032: def chat(messages, model="deepseek-coder:33b", timeout=300):
+0033:     """Send a chat request to the authenticated remote Ollama gateway."""
+0034: [REDACTED: POSSIBLE CREDENTIAL]
+
+0035: 
+0036:     payload = {
+0037:         "model": model,
+0038:         "messages": messages,
+0039:         "stream": False,
+0040:         "options": {
+0041:             "num_ctx": 4096,
+0042:             "num_predict": 1500,
+0043:             "temperature": 0.2,
+0044:         },
+0045:     }
+0046: 
+0047:     request = urllib.request.Request(
+0048:         f"{base_url}/api/chat",
+0049:         data=json.dumps(payload).encode("utf-8"),
+0050:         headers={
+0051: [REDACTED: POSSIBLE CREDENTIAL]
+
+0052:             "Content-Type": "application/json",
+0053:         },
+0054:         method="POST",
+0055:     )
+0056: 
+0057:     try:
+0058:         with urllib.request.urlopen(request, timeout=timeout) as response:
+0059:             result = json.load(response)
+0060:     except urllib.error.HTTPError as exc:
+0061:         detail = exc.read().decode("utf-8", errors="replace")
+0062:         raise RuntimeError(
+0063:             f"Remote Ollama returned HTTP {exc.code}: {detail[:1000]}"
+0064:         ) from exc
+0065:     except Exception as exc:
+0066:         raise RuntimeError(
+0067:             f"Could not reach remote Ollama. Check that Kaggle and "
+0068:             f"Cloudflare Tunnel are still running. Details: {exc}"
+0069:         ) from exc
+0070: 
+0071:     return result.get("message", {}).get("content", "")
+0072: 
+0073: 
+0074: if __name__ == "__main__":
+0075:     answer = chat([
+0076:         {
+0077:             "role": "user",
+0078:             "content": "Reply with exactly: Remote DeepSeek connection works."
+0079:         }
+0080:     ])
+0081:     print(answer)
+
+=== RELEVANT PACKAGE VERSIONS ===
+mcp: not installed
+httpx: not installed
+ollama: not installed
+pydantic: not installed
+
+=== WORKSPACE FILE LIST ===
+agent-audit.txt
+ai.py
+ai.py.backup
+client.py
+client.py.backup
+client.py.before-file-tools
+client.py.before-load-command
+client.py.workspace-backup
+server.py
+server.py.backup
+server.py.backup2
+server.py.backup3
+server.py.before-file-tools

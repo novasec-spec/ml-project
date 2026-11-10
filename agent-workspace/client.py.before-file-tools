@@ -1,0 +1,364 @@
+
+import asyncio
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+CONFIG_FILE = Path.home() / ".config/remote-ollama/env"
+
+
+SYSTEM_PROMPT = """
+You are a careful coding agent connected to a remote Ollama model
+and a local MCP coding server.
+
+Rules:
+- Inspect files using tools before making claims about a project.
+- Use relative paths inside the configured workspace.
+- Explain proposed changes before applying them.
+- Never claim a tool ran unless it actually ran.
+- Never apply edits without explicit user approval.
+- Prefer small, targeted, testable changes.
+- Do not expose API keys, credentials, or secrets.
+- If a tool fails, explain the error honestly.
+"""
+
+
+def load_config():
+    """Load remote Ollama connection settings."""
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+
+            os.environ.setdefault(key, value)
+
+    url = os.environ.get("OLLAMA_REMOTE_URL", "").rstrip("/")
+    api_key = os.environ.get("OLLAMA_REMOTE_API_KEY", "")
+
+    if not url or not api_key:
+        raise RuntimeError(
+            f"Missing OLLAMA_REMOTE_URL or OLLAMA_REMOTE_API_KEY. "
+            f"Check {CONFIG_FILE}"
+        )
+
+    return url, api_key
+
+
+def ollama_chat(messages, tools):
+    """Send a chat request to the remote Ollama API."""
+    base_url, api_key = load_config()
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False,
+        "tools": tools,
+        "options": {
+            "num_ctx": 4096,
+            "num_predict": 1200,
+            "temperature": 0.1,
+        },
+    }
+
+    request = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            result = json.load(response)
+
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Ollama HTTP {exc.code}: {detail}"
+        ) from exc
+
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Could not reach remote Ollama: {exc.reason}. "
+            "Check your internet connection and Kaggle tunnel."
+        ) from exc
+
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "The remote Ollama request timed out."
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Ollama returned an unexpected response.")
+
+    message = result.get("message")
+
+    if not isinstance(message, dict):
+        raise RuntimeError(
+            "Ollama response has no message field: "
+            + json.dumps(result)[:1500]
+        )
+
+    return message
+
+
+def schema_to_ollama(tool):
+    """Convert an MCP tool schema to Ollama's function-tool format."""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or tool.name,
+            "parameters": tool.inputSchema,
+        },
+    }
+
+
+def parse_tool_arguments(arguments):
+    """Normalize tool-call arguments to a dictionary."""
+    if isinstance(arguments, dict):
+        return arguments
+
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON in tool arguments: {exc}"
+            ) from exc
+
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise ValueError("Tool arguments must be a JSON object.")
+
+
+def get_tool_output(result):
+    """Extract readable content from an MCP tool result."""
+    parts = []
+
+    for item in result.content:
+        if hasattr(item, "text"):
+            parts.append(item.text)
+
+    output = "\n".join(parts) or "(Tool returned no text.)"
+
+    if result.isError:
+        output = "TOOL ERROR: " + output
+
+    return output
+
+
+def request_edit_approval(name, arguments):
+    """Require explicit terminal approval before a file-changing tool."""
+    if name != "apply_edit":
+        return True
+
+    if arguments.get("confirm") is not True:
+        print("\nBlocked: apply_edit requires confirm=true.")
+        print("The edit was not applied.")
+        return False
+
+    print("\n--- FILE EDIT APPROVAL REQUIRED ---")
+    print("Tool:", name)
+    print("Path:", arguments.get("path", "(missing)"))
+    print("\nOld text:")
+    print(arguments.get("old_text", "(missing)"))
+    print("\nProposed replacement:")
+    print(arguments.get("new_text", "(missing)"))
+
+    answer = input("\nApply this exact edit? Type YES to approve: ").strip()
+
+    return answer == "YES"
+
+
+async def main():
+    try:
+        load_config()
+    except Exception as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return
+
+    workspace = Path.home() / "HopeLinkCancer-AI"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    server_env = os.environ.copy()
+    server_env["CODING_WORKSPACE"] = str(workspace)
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(BASE_DIR / "server.py")],
+        cwd=str(BASE_DIR),
+        env=server_env,
+    )
+
+    print("Starting MCP coding agent...")
+    print(f"Workspace server: {BASE_DIR / 'server.py'}")
+
+    try:
+        async with stdio_client(server_params) as (
+            read_stream,
+            write_stream,
+        ):
+            async with ClientSession(
+                read_stream, write_stream
+            ) as session:
+                await session.initialize()
+
+                mcp_response = await session.list_tools()
+                mcp_tools = mcp_response.tools
+
+                tools = [
+                    schema_to_ollama(tool)
+                    for tool in mcp_tools
+                ]
+
+                tool_names = {
+                    tool.name for tool in mcp_tools
+                }
+
+                print(f"Connected to MCP server. Tools: {len(tools)}")
+                print(f"Remote model: {MODEL}")
+                print("Commands: /clear, /tools, exit")
+                print("")
+
+                messages = [
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT,
+                    }
+                ]
+
+                while True:
+                    try:
+                        user_text = input("\nYou> ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nExiting...")
+                        break
+
+                    if not user_text:
+                        continue
+
+                    if user_text.lower() in {"exit", "quit"}:
+                        break
+
+                    if user_text == "/clear":
+                        messages = [
+                            {
+                                "role": "system",
+                                "content": SYSTEM_PROMPT,
+                            }
+                        ]
+                        print("Conversation history cleared.")
+                        continue
+
+                    if user_text == "/tools":
+                        print("\nAvailable MCP tools:")
+                        for tool in mcp_tools:
+                            print(f"- {tool.name}: {tool.description or ''}")
+                        continue
+
+                    messages.append({
+                        "role": "user",
+                        "content": user_text,
+                    })
+
+                    for round_number in range(8):
+                        try:
+                            answer = await asyncio.to_thread(
+                                ollama_chat,
+                                messages,
+                                tools,
+                            )
+                        except Exception as exc:
+                            print(f"\nRemote model error: {exc}")
+                            # Avoid keeping a failed request in history.
+                            messages.pop()
+                            break
+
+                        # Keep the assistant response, including tool calls,
+                        # in the conversation sent back to Ollama.
+                        messages.append(answer)
+
+                        calls = answer.get("tool_calls") or []
+
+                        if not calls:
+                            content = answer.get("content", "")
+                            print("\nAssistant>\n" + content)
+                            break
+
+                        for call in calls:
+                            function = call.get("function", {})
+                            name = function.get("name", "")
+                            raw_arguments = function.get("arguments", {})
+
+                            try:
+                                arguments = parse_tool_arguments(
+                                    raw_arguments
+                                )
+
+                                if name not in tool_names:
+                                    raise ValueError(
+                                        f"Unknown MCP tool: {name}"
+                                    )
+
+                                if not request_edit_approval(
+                                    name, arguments
+                                ):
+                                    output = (
+                                        "EDIT NOT APPLIED. The user did "
+                                        "not approve this change. Explain "
+                                        "the proposed edit and wait for "
+                                        "a new request."
+                                    )
+                                else:
+                                    result = await session.call_tool(
+                                        name, arguments
+                                    )
+                                    output = get_tool_output(result)
+
+                            except Exception as exc:
+                                output = f"TOOL ERROR: {exc}"
+
+                            # Return each tool result to Ollama, including
+                            # the function name for clearer tool tracking.
+                            messages.append({
+                                "role": "tool",
+                                "name": name,
+                                "content": output[:12000],
+                            })
+
+                            print(f"\n[{name}]\n{output[:2500]}")
+
+                    else:
+                        print(
+                            "\nStopped after 8 tool rounds to "
+                            "prevent runaway calls."
+                        )
+
+    except Exception as exc:
+        print(f"\nMCP client error: {exc}", file=sys.stderr)
+
+    print("\nClient closed.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

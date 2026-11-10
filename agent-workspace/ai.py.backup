@@ -1,0 +1,81 @@
+import json
+import os
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONFIG_FILE = Path.home() / ".config/remote-ollama/env"
+
+
+def load_config():
+    """Load private connection settings from the config file."""
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+    url = os.environ.get("OLLAMA_REMOTE_URL", "").rstrip("/")
+    api_key = os.environ.get("OLLAMA_REMOTE_API_KEY", "")
+
+    if not url or not api_key:
+        raise RuntimeError(
+            f"Set OLLAMA_REMOTE_URL and OLLAMA_REMOTE_API_KEY "
+            f"in {CONFIG_FILE}"
+        )
+
+    return url, api_key
+
+
+def chat(messages, model="deepseek-coder:33b", timeout=300):
+    """Send a chat request to the authenticated remote Ollama gateway."""
+    base_url, api_key = load_config()
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "num_ctx": 4096,
+            "num_predict": 1500,
+            "temperature": 0.2,
+        },
+    }
+
+    request = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Remote Ollama returned HTTP {exc.code}: {detail[:1000]}"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not reach remote Ollama. Check that Kaggle and "
+            f"Cloudflare Tunnel are still running. Details: {exc}"
+        ) from exc
+
+    return result.get("message", {}).get("content", "")
+
+
+if __name__ == "__main__":
+    answer = chat([
+        {
+            "role": "user",
+            "content": "Reply with exactly: Remote DeepSeek connection works."
+        }
+    ])
+    print(answer)

@@ -1,0 +1,171 @@
+import difflib
+import os
+import subprocess
+from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("Remote DeepSeek Coding Agent")
+
+WORKSPACE = Path(
+    os.environ.get("CODING_WORKSPACE", str(Path.home() / "ml-project"))
+).expanduser().resolve()
+
+MAX_FILE_BYTES = 300_000
+IGNORED_DIRS = {
+    ".git", ".venv", "venv", "node_modules",
+    "__pycache__", ".next", "dist", "build"
+}
+
+
+def safe_path(relative_path: str) -> Path:
+    """Resolve a path and prevent access outside the workspace."""
+    path = (WORKSPACE / relative_path).resolve()
+    if path != WORKSPACE and WORKSPACE not in path.parents:
+        raise ValueError("Path is outside the configured workspace.")
+    return path
+
+
+def require_file(path: Path) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+    if path.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("File is too large to process safely.")
+
+
+@mcp.tool()
+def workspace_info() -> str:
+    """Show the configured workspace directory."""
+    return f"Workspace: {WORKSPACE}"
+
+
+@mcp.tool()
+def list_files(path: str = ".", max_entries: int = 200) -> str:
+    """List files under a workspace-relative directory."""
+    root = safe_path(path)
+    if not root.is_dir():
+        raise NotADirectoryError(path)
+
+    results = []
+    for item in sorted(root.rglob("*")):
+        if any(part in IGNORED_DIRS for part in item.parts):
+            continue
+        if item.is_file():
+            results.append(str(item.relative_to(WORKSPACE)))
+            if len(results) >= min(max_entries, 500):
+                break
+
+    return "\n".join(results) if results else "No files found."
+
+
+@mcp.tool()
+def read_file(path: str) -> str:
+    """Read a UTF-8 text file within the workspace."""
+    target = safe_path(path)
+    require_file(target)
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("File is not UTF-8 text.") from exc
+
+
+@mcp.tool()
+def search_code(query: str, path: str = ".", max_results: int = 80) -> str:
+    """Search text files for a literal, case-insensitive query."""
+    root = safe_path(path)
+    if not root.exists():
+        raise FileNotFoundError(path)
+
+    results = []
+    candidates = [root] if root.is_file() else root.rglob("*")
+
+    for item in candidates:
+        if not item.is_file():
+            continue
+        if any(part in IGNORED_DIRS for part in item.parts):
+            continue
+        try:
+            if item.stat().st_size > MAX_FILE_BYTES:
+                continue
+            lines = item.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        for line_no, line in enumerate(lines, 1):
+            if query.casefold() in line.casefold():
+                results.append(
+                    f"{item.relative_to(WORKSPACE)}:{line_no}: {line[:300]}"
+                )
+                if len(results) >= min(max_results, 300):
+                    return "\n".join(results)
+
+    return "\n".join(results) if results else "No matches found."
+
+
+@mcp.tool()
+def propose_edit(path: str, old_text: str, new_text: str) -> str:
+    """Preview an exact text replacement. Does not modify the file."""
+    target = safe_path(path)
+    require_file(target)
+    original = target.read_text(encoding="utf-8")
+
+    occurrences = original.count(old_text)
+    if not old_text:
+        raise ValueError("old_text must not be empty.")
+    if occurrences != 1:
+        raise ValueError(
+            f"Expected old_text exactly once, found {occurrences}. "
+            "Provide a more specific snippet."
+        )
+
+    updated = original.replace(old_text, new_text, 1)
+    diff = difflib.unified_diff(
+        original.splitlines(True),
+        updated.splitlines(True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    )
+    return "".join(diff) or "No changes."
+
+
+@mcp.tool()
+def apply_edit(path: str, old_text: str, new_text: str,
+               confirm: bool = False) -> str:
+    """Apply an exact replacement only when confirm=True."""
+    if not confirm:
+        return "Not changed. Review propose_edit output, then call with confirm=True."
+
+    target = safe_path(path)
+    require_file(target)
+    original = target.read_text(encoding="utf-8")
+
+    if not old_text or original.count(old_text) != 1:
+        raise ValueError("old_text must match exactly once.")
+
+    updated = original.replace(old_text, new_text, 1)
+    target.write_text(updated, encoding="utf-8")
+    return f"Updated {path}. Review the diff and run relevant tests."
+
+
+@mcp.tool()
+def run_python_tests(path: str = ".") -> str:
+    """Run pytest on a workspace-relative path, with a timeout."""
+    target = safe_path(path)
+    if not target.exists():
+        raise FileNotFoundError(path)
+
+    result = subprocess.run(
+        ["python", "-m", "pytest", str(target)],
+        cwd=WORKSPACE,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = (result.stdout + "\n" + result.stderr).strip()
+    return f"Exit code: {result.returncode}\n{output[-12000:]}"
+
+
+if __name__ == "__main__":
+    print(f"Workspace: {WORKSPACE}", file=__import__("sys").stderr, flush=True)
+    mcp.run()
